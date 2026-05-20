@@ -115,6 +115,11 @@ public class SwipeableView: ExpoView {
     // MARK: - State
     private var actionsView: UIView?
     private var contentView: UIView?
+    // Track React-managed children explicitly via Fabric's mount hooks.
+    // Using UIView.subviews is unsafe because UIKit/Expo/RN may insert helper
+    // views (clipping wrappers, focus indicators, etc.) that shift indices and
+    // cause us to transform the wrong UIView.
+    private var reactChildren: [UIView] = []
     private var currentTranslation: CGFloat = 0
     private var isOpen = false
     private var startOffset: CGFloat = 0
@@ -315,6 +320,18 @@ public class SwipeableView: ExpoView {
             currentAnimator = nil
             isAnimating = false
 
+            // Reset internal gesture/translation state so a re-attached view
+            // (FlashList recycle) does not re-apply a stale currentTranslation
+            // in the next layoutSubviews pass.
+            currentTranslation = 0
+            isOpen = false
+            pendingShouldOpen = false
+            startOffset = 0
+            lastEmittedProgress = -1
+            isDragging = false
+            isGestureActivated = false
+            gestureStartTranslation = 0
+
             // Reset layer properties to prevent corruption
             contentView?.transform = .identity
             contentView?.layer.zPosition = 0
@@ -494,36 +511,61 @@ public class SwipeableView: ExpoView {
 
     // MARK: - View Lifecycle
 
-    public override func didAddSubview(_ subview: UIView) {
-        super.didAddSubview(subview)
+    // Track React-managed children only. Fabric guarantees this fires solely
+    // for views Fabric mounts (the JSX children) — never for UIKit helper
+    // views that UIView.subviews would otherwise include.
+    public override func mountChildComponentView(_ childComponentView: UIView, index: Int) {
+        super.mountChildComponentView(childComponentView, index: index)
+        let clampedIndex = min(max(index, 0), reactChildren.count)
+        reactChildren.insert(childComponentView, at: clampedIndex)
+        refreshChildAssignments()
+    }
 
-        let reactSubviews = subviews
+    public override func unmountChildComponentView(_ childComponentView: UIView, index: Int) {
+        // Fabric recycles UIView instances. Before handing this child back, undo any
+        // transform / zPosition we may have applied — otherwise the next React
+        // component that receives this recycled UIView inherits our stale state and
+        // appears translated.
+        childComponentView.transform = .identity
+        childComponentView.layer.zPosition = 0
+
+        if index >= 0 && index < reactChildren.count && reactChildren[index] === childComponentView {
+            reactChildren.remove(at: index)
+        } else if let found = reactChildren.firstIndex(where: { $0 === childComponentView }) {
+            reactChildren.remove(at: found)
+        }
+
+        if childComponentView === contentView { contentView = nil }
+        if childComponentView === actionsView { actionsView = nil }
+
+        super.unmountChildComponentView(childComponentView, index: index)
+        refreshChildAssignments()
+    }
+
+    private func refreshChildAssignments() {
         let wasActionsNil = actionsView == nil
         let wasContentNil = contentView == nil
 
-        // Validate subview count before assignment
-        switch reactSubviews.count {
+        switch reactChildren.count {
         case 0:
-            // Should not happen - we just added a subview
             contentView = nil
             actionsView = nil
         case 1:
-            contentView = reactSubviews[0]
+            contentView = reactChildren[0]
             contentView?.layer.zPosition = 1
             actionsView = nil
         case 2:
-            actionsView = reactSubviews[0]
+            actionsView = reactChildren[0]
             actionsView?.layer.zPosition = -1
-            contentView = reactSubviews[1]
+            contentView = reactChildren[1]
             contentView?.layer.zPosition = 1
         default:
-            // More than 2 children - log warning but use first two
             #if DEBUG
-            print("[SwipeableView] Warning: Expected 1-2 subviews, got \(reactSubviews.count)")
+            print("[SwipeableView] Warning: Expected 1-2 React children, got \(reactChildren.count)")
             #endif
-            actionsView = reactSubviews[0]
+            actionsView = reactChildren[0]
             actionsView?.layer.zPosition = -1
-            contentView = reactSubviews[1]
+            contentView = reactChildren[1]
             contentView?.layer.zPosition = 1
         }
 
